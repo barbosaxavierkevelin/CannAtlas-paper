@@ -1,0 +1,745 @@
+---
+title: "Cannabis Expression Atlas - Methods"
+author: "Kevelin Barbosa-Xavier, Francisnei Pedrosa-Silva, Fabricio Almeida-Silva, Thiago M. Venancio"
+date: "2024-08-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, warning = FALSE, message = FALSE)
+```
+
+## **Gene expression classification**
+
+- load required packages
+```{r here}
+set.seed(123) # for reproducibility
+library(here)
+library(BioNERO)
+library(tidyverse)
+library(ComplexHeatmap)
+library(patchwork)
+library(Biostrings)
+library(dplyr)
+library(bears)
+library(SummarizedExperiment)
+library(rvest)
+library(stats)
+library(matrixStats)
+library(EnvStats)
+library(arrow)
+library(TissueEnrich)
+library(forcats)
+library(ggplot2)
+library(janitor)
+```
+
+
+```{r echo = FALSE, fig.align='center'}
+data <- "/media/winterfell/kevelin/doutorado/analises_JLmY_reference/CSEA_LATEST_08_2024/kevelin/"
+```
+```{r}
+# choose the work directoy
+data <- "/your/path/here/"
+```
+
+- load data
+```{r}
+load("data/se_atlas_gene.rda")
+```
+
+### Expressed genes
+
+ - Here we will get the expression matrix in TPM from Salmon quantification.
+
+```{r}
+# Get expression data in long format
+## TPM
+exp_tpm <- assay(se_atlas_gene, "gene_TPM") |>
+    reshape2::melt() |>
+    mutate(
+        Gene = as.character(Var1),
+        Sample = as.character(Var2),
+        TPM = as.numeric(value)
+    ) |>
+    dplyr::select(Gene, Sample, TPM)
+
+# organize the TPM values in a matrix of samples per gene
+exp_tpm_reorganized <- exp_tpm %>%
+  pivot_wider(names_from = Sample, values_from = TPM)
+
+exp_tpm_reorganized <- as.data.frame(exp_tpm_reorganized)
+rownames(exp_tpm_reorganized) <- exp_tpm_reorganized$Gene
+exp_tpm_reorganized$Gene <- NULL
+
+save(exp_tpm_reorganized, compress = "xz",
+     file = here(data, "data/exp_tpm_reorganized.rda"))
+```
+
+ - We will use for downstream analysis just the genes with at least TPM = 1 in at least one sample:
+```{r}
+#Filtering the TPM matrix
+TPM_temp <- as.data.frame(exp_tpm_reorganized)
+
+#Assigning the value of 1 to all values >= 1 in the matrix.
+TPM_temp[TPM_temp >= 1] <- 1
+
+#Assigning the value 0 to all values < 1 in the matrix.
+TPM_temp[TPM_temp < 1] <- 0
+
+#Creating a column with the count of values in each row
+TPM_temp$count <- rowSums(TPM_temp)
+
+#Filtering the matrix by lines that have a count of at least 1, i.e. the gene was expressed in at least 1 sample
+TPM_expresso <- TPM_temp |> dplyr::filter(count >= 1)
+
+media_genes_expressos_por_biosample <- sum(TPM_expresso$count) / 394
+
+#Filtering the matrix by lines that have a count of 0, that is, the gene was not expressed in at least 1 sample.
+TPM_nexpresso <- TPM_temp |> dplyr::filter(count == 0)
+
+#List with the names of genes expressed in at least 1 sample
+id_TPM_expresso <- rownames(TPM_expresso)
+id_TPM_expresso <- as.data.frame(id_TPM_expresso)
+names(id_TPM_expresso)[1] <- "Gene" 
+
+# Filtering my original TPM matrix
+exp_tpm_reorganized$Gene <- rownames(exp_tpm_reorganized)
+
+# Matrix of expressed genes
+TPM_expresso <- inner_join(id_TPM_expresso, exp_tpm_reorganized, by = 'Gene')
+row.names(TPM_expresso) <- TPM_expresso$Gene
+TPM_expresso$Gene <- NULL
+head(TPM_expresso)
+
+# Here I have the genes that have TPM in at least 1 in at least 1 sample.
+save(TPM_expresso,
+     file = here::here(data, "data/TPM_expresso.rda")
+)
+load("data/TPM_expresso.rda")
+```
+
+From `27640 quantified genes`, `25787` have TPM >= 1 in at least one sample and are considered `expressed genes` to downstream analysis.
+It means that `1853` genes are `not expressed`.
+
+### Tau index
+
+Here we will calculate the $\tau$ index of tissue-specificity
+using log-transformed TPM values of genes with median TPM >= 5 in at least one plant part (tissue).
+
+- First, let's define a function to calculate $\tau$ for each gene.
+```{r}
+# x is a numeric vector with a gene's median expression values across tissues
+calculate_tau <- function(x) {
+    if(all(!is.na(x))) {
+        if(min(x, na.rm=TRUE) >= 0) {
+            if(max(x)!=0) {
+                x <- (1-(x/max(x)))
+                res <- sum(x, na.rm=TRUE)
+                res <- res/(length(x)-1)
+            } else {
+                res <- 0
+            }
+        } else {
+            res <- NA
+        }
+    } else {
+        res <- NA
+    }
+    return(res)
+}
+```
+
+- create an expression matrix with genes in row names and median expression per tissue in column.
+Here we will need to load the parquet dir to get the data
+```{r eval = FALSE}
+#parquet dir
+db <- open_dataset("data/app_data/parquet_dir")
+```
+
+- For this analysis we will exclude samples from tissues as: "mixed". We will also exclude tissues with lesser than 6 samples. (xylem, shoots and core)
+```{r}
+load("data/sample_metadata_new.rda")
+# Tissues to use
+tissues <- c("Stem", "Leaf", "Trichome", "Seed", "Flower_female", "Root", "Flower_male",
+             "Induced_male_flower", "Hypocotyl", "Bast_Fibre")
+
+# Create a vector of all gene IDs and split it into a list of 100 vectors
+chunk <- function(x,n) split(x, cut(seq_along(x), n, labels = FALSE))
+
+genes <- db |>
+    dplyr::select(Gene) |>
+    unique() |>
+    collect() |>
+    pull(Gene) |>
+    chunk(n = 100)
+
+# Get median expression per tissue
+median_per_tissue_long <- Reduce(rbind, lapply(seq_along(genes), function(x) {
+    message("Working on set ", x)
+    df <- db |>
+        dplyr::select(Gene, Sample, TPM, Tissue) |>
+        filter(Tissue %in% tissues) |>
+        filter(Gene %in% genes[[x]]) |>
+        group_by(Tissue, Gene) |>
+        summarise(
+            median = median(TPM)
+        ) |>
+        ungroup() |>
+        collect()
+
+    return(df)
+}))
+
+
+median_per_tissue <- pivot_wider(
+    median_per_tissue_long, names_from = Tissue, values_from = median
+) |>
+    tibble::column_to_rownames("Gene") |>
+    as.matrix()
+
+save(median_per_tissue,
+     file = here::here(data, "data/median_per_tissue.rda")
+)
+```
+
+Before calculating $\tau$, we will just consider genes with median TPM >=5 in a tissue.
+
+```{r}
+# Remove genes with median TPM <5 in all tissues
+remove <- apply(median_per_tissue, 1, function(x) all(x<5))
+final_median_per_tissue <- median_per_tissue[!remove, ]
+
+save(final_median_per_tissue,
+     file = here::here(data, "data/final_median_per_tissue.rda")
+)
+
+# Calculate Tau indices
+tau <- apply(final_median_per_tissue, 1, calculate_tau)
+tau <- as.data.frame(tau)
+tau$Gene <- row.names(tau)
+```
+
+We found `18766 genes with median TPM >=5 in a tissue`.
+
+### Housekeeping genes
+
+For housekeeping genes identification we will use genes with TPM >= 5 in all samples.
+```{r}
+exp_tpm_reorganized$Gene <- NULL
+#Filtering the TPM matrix 
+TPM_temp_HK <- as.data.frame(exp_tpm_reorganized)
+
+#Assigning the value 0 to all values < 5 in the matrix.
+TPM_temp_HK[TPM_temp_HK < 5] <- 0
+
+#Assigning the value of 1 to all values >= 5 in the matrix.
+TPM_temp_HK[TPM_temp_HK >= 5] <- 1
+
+#Creating a column with the count of values in each row
+TPM_temp_HK$count <- rowSums(TPM_temp_HK)
+
+#Filtering the matrix by the rows that have a count of 394, that is, the gene was expressed in all samples
+TPM_temp_HK <- TPM_temp_HK |> dplyr::filter(count == 394)
+
+#List of gene names with TPM >= 5 in all samples
+id_TPM_expresso_hk <- rownames(TPM_temp_HK)
+id_TPM_expresso_hk <- as.data.frame(id_TPM_expresso_hk)
+names(id_TPM_expresso_hk)[1] <- "Gene" 
+
+#Filtering my original TPM matrix
+exp_tpm_reorganized$Gene <- rownames(exp_tpm_reorganized)
+
+# Matrix of expressed genes
+HK_putative_genes_TPM <- inner_join(id_TPM_expresso_hk, exp_tpm_reorganized, by = 'Gene')
+row.names(HK_putative_genes_TPM) <- HK_putative_genes_TPM$Gene
+HK_putative_genes_TPM$Gene <- NULL
+head(HK_putative_genes_TPM)
+
+# Here I have the genes that have a TPM of at least 5 in all samples and that will be used to identify housekeeping genes.
+save(HK_putative_genes_TPM,
+     file = here::here(data, "data/HK_putative_genes_TPM.rda")
+)
+```
+
+- We identify `971 genes with TPM >= 5 in all samples`. These genes will be used for housekeeping genes identification.
+
+```{r}
+#statistics for each gene
+
+# mean
+HK_putative_genes_TPM$mean <- rowMeans(HK_putative_genes_TPM)
+
+#median
+HK_putative_genes_TPM$median <- rowMedians(as.matrix(HK_putative_genes_TPM[, c(1:394)]))
+
+#sd
+HK_putative_genes_TPM$sd <- rowSds(as.matrix(HK_putative_genes_TPM[,c(1:394)]))
+
+# calculating the coefficient of variation for each gene, relative to the median
+HK_putative_genes_TPM$CoVmediana <- (HK_putative_genes_TPM$sd/HK_putative_genes_TPM$median)
+
+# identifying the maximum and minimum tpm values ​​for each gene
+HK_putative_genes_TPM$max <- rowMaxs(as.matrix(HK_putative_genes_TPM[,c(1:394)]))
+HK_putative_genes_TPM$min <- rowMins(as.matrix(HK_putative_genes_TPM[,c(1:394)]))
+
+# calculating the maximum fold change for each gene
+HK_putative_genes_TPM$MFC <- HK_putative_genes_TPM$max / HK_putative_genes_TPM$min
+
+# calculating the product between the gfc and the covmedian
+HK_putative_genes_TPM$MFC_CoVmedian <- HK_putative_genes_TPM$CoVmedian * HK_putative_genes_TPM$MFC
+
+#identifying the first quartile MEDIAN
+HK_putative_genes_TPM$first_quartile_median <- quantile(HK_putative_genes_TPM$MFC_CoVmedian, probs = 0.25)
+```
+
+- genes HK by quantile
+```{r}
+# separating genes within the first quartile
+genes_HK <- HK_putative_genes_TPM |> dplyr::filter(MFC_CoVmedian <= HK_putative_genes_TPM$first_quartile_median)
+genes_HK$Gene <- row.names(genes_HK)
+```
+
+Based on MFC_CoVmedian value into the first quartil, are 243 HK genes.
+
+We will also filt these genes by TAU index, were 0.4 will be used as threshold to classify the genes into hk genes.
+
+- TAU DOS GENES HK
+```{r}
+# identifying the HK genes
+genes_HK <- dplyr::inner_join(genes_HK, tau, by = "Gene")
+
+genes_HK <- subset(genes_HK, tau <= 0.4)
+rownames(genes_HK) <- genes_HK$Gene
+genes_HK$Gene <- NULL
+
+genes_hk_stats <- genes_HK
+
+id_HK_genes <- row.names(genes_HK)
+id_HK_genes <- as.data.frame(id_HK_genes)
+names(id_HK_genes) <- "Gene"
+HK_tpm_matrix <- dplyr::inner_join(id_HK_genes, exp_tpm_reorganized, by = "Gene")
+row.names(HK_tpm_matrix) <- HK_tpm_matrix$Gene
+HK_tpm_matrix$Gene <- NULL
+
+save(HK_tpm_matrix, compress = "xz",
+     file = here(data, "data/HK_tpm_matrix.rda"))
+
+save(id_HK_genes, compress = "xz",
+     file = here(data, "data/id_HK_genes.rda"))
+
+save(genes_hk_stats, compress = "xz",
+     file = here(data, "data/genes_hk_stats.rda"))
+```
+
+We found `132 Housekeeping genes`. These are genes with TPM >= 5 in all samples, MFC_CoVmedian value into the first quartile and with a Tau index <= 0.4.
+
+- Housekeeping genes heatmap
+
+```{r}
+sample_metadata_new$BioSample <- row.names(sample_metadata_new)
+#preparing the annotation column of the heatmap
+anot_heatmap <- data_frame(BioSample = sample_metadata_new$BioSample, Tissue = sample_metadata_new$Tissue, Chemotype = sample_metadata_new$Chemotype)
+anot_heatmap <- as.data.frame(anot_heatmap)
+rownames(anot_heatmap) <- anot_heatmap$BioSample
+anot_heatmap <- as.data.frame(anot_heatmap)
+anot_heatmap$BioSample <- NULL
+anot_heatmap$Chemotype[is.na(anot_heatmap$Chemotype)] <- "Unknown"
+
+save(anot_heatmap,
+     file = here::here(data, "data/anot_heatmap.rda")
+)
+
+# expression pallet for heatmap
+expression_palette <- c("#FFFFCC", "#FFFDC8", "#FFFCC4", "#FFFAC1", "#FFF9BD", "#FFF7BA", 
+                        "#FFF6B6", "#FFF4B3", "#FFF3AF", "#FFF1AC", "#FFF0A8", "#FFEFA4", 
+                        "#FFEDA1", "#FEEB9D", "#FEEA9A", "#FEE897", "#FEE793", "#FEE590", 
+                        "#FEE38C", "#FEE289", "#FEE086", "#FEDF82", "#FEDD7F", "#FEDB7B", 
+                        "#FEDA78", "#FED875", "#FED571", "#FED16E", "#FECE6A", "#FECB67", 
+                        "#FEC864", "#FEC560", "#FEC25D", "#FEBE59", "#FEBB56", "#FEB853", 
+                        "#FEB54F", "#FEB24C", "#FDAF4A", "#FDAC49", "#FDA948", "#FDA646", 
+                        "#FDA345", "#FDA044", "#FD9D43", "#FD9A41", "#FD9740", "#FD943F", 
+                        "#FD913D", "#FD8E3C", "#FC8A3B", "#FC8539", "#FC8038", "#FC7B36", 
+                        "#FC7635", "#FC7134", "#FC6B32", "#FC6631", "#FC612F", "#FC5C2E", 
+                        "#FC572C", "#FC522B", "#FB4D29", "#F94928", "#F74527", "#F54026", 
+                        "#F33C25", "#F13824", "#EF3423", "#ED3021", "#EB2B20", "#E9271F", 
+                        "#E51F1D", "#E31B1C", "#E10F1B", "#DD161D", "#DA141E", "#D7121F", 
+                        "#D4101F", "#D10D20", "#CE0B21", "#CB0922", "#C80723", "#C50523", 
+                        "#C10324", "#BE0125", "#BB0026", "#B60026", "#B10026", "#AC0026", 
+                        "#A70026", "#A20026", "#9D0026", "#980026", "#930026", "#8E0026", 
+                        "#890026", "#840026", "#800026")
+
+save(expression_palette,
+     file = here::here(data, "data/expression_palette.rda")
+)
+
+# Color palette for annotation info
+annotation_colors_1 <- list(
+       Tissue = c(
+       "Trichome" = "#0000FF",
+       "Flower_female" = "#FF1480", 
+       "Flower_male"= "#FFC0CB",
+       "Induced_male_flower"= "purple",
+       "Bast_Fibre" = "#000000",
+       "Hypocotyl" = "#FFA500",
+       "Leaf" = "#006400",
+       "Root" = "#8B4513",
+       "Seed" = "#40e0d0",
+       "Stem" = "#AFCC65", 
+       "Shoots" = "#669201", 
+       "Core" = "#C2A17B", 
+       "Mixed" = "#886E3E", 
+       "Xylem" = "#CD960C"),
+       Chemotype = c(
+         "Type I" = "#DC143C",
+         "Type II" = "#FFA500",
+         "Type III" = "#009100",
+         "Unknown" = "lightgrey"
+  )
+     )
+
+save(annotation_colors_1,
+     file = here::here(data, "data/annotation_colors_1.rda")
+)
+```
+
+
+```{r}
+genes_hk_log <- as.matrix(log2(HK_tpm_matrix + 1))
+
+save(genes_hk_log,
+     file = here::here(data, "data/genes_hk_log.rda")
+)
+```
+
+```{r}
+load("data/genes_hk_log.rda")
+load("data/expression_palette.rda")
+load("data/anot_heatmap.rda")
+p_heatmap_HK <- pheatmap::pheatmap(genes_hk_log,
+                   color = expression_palette,
+                   annotation_col = anot_heatmap,
+                   annotation_colors = annotation_colors_1,
+                   cluster_cols = T,
+                   cluster_rows = T,
+                   show_rownames = F,
+                   show_colnames = F,
+                   fontsize = 14,
+                   name = "Log2(TPM)",
+                   main = "Expression of Housekeeping genes",
+                   )
+
+p_heatmap_HK
+
+save(p_heatmap_HK,
+     file = here::here(data, "data/p_heatmap_HK.rda")
+)
+```
+
+### Othe expression classes
+
+Here we will use the TissueEnrich packcage and the tau index to classify genes into expression categories.
+
+-TissueEnrich
+```{r}
+se_for_TE <- SummarizedExperiment(assays = SimpleList(final_median_per_tissue), rowData = row.names(final_median_per_tissue), colData = colnames(final_median_per_tissue))
+load("data/se_for_TE.rda")
+save(se_for_TE,
+     file = here::here(data, "data/se_for_TE.rda")
+)
+```
+
+- We need to run just the `teGeneRetrieval` function from the  TisueEnrich package. I can't install it at the R 4.3 because the `ensurer` dependence, with needs to be the 1.1 version, but it is not available for R 4.3, so I run this step in a R 4.4 environment.
+```{r}
+gene_expression_te <- teGeneRetrieval(se_for_TE, maxNumberOfTissues = 2)
+```
+
+```{r}
+load("data/gene_expression_te.rda")
+```
+
+```{r}
+expression_genes_by_tissue <- data.frame(assay(gene_expression_te))
+head(expression_genes_by_tissue)
+```
+
+```{r}
+# Identifing the expression groups obtained by tissueenrich
+te_group <- data.frame(unique(expression_genes_by_tissue$Group))
+head(te_group)
+names(te_group)[1] <- "Group"
+
+class_genes_tau <- left_join(expression_genes_by_tissue, tau, by = "Gene")
+
+# The tissue-enhanced and tissue-enriched classes of the tissueenrich package will be considered tissue-enriched genes
+class_genes_tau$Group[class_genes_tau$Group == "Tissue-Enhanced"] <- "Tissue-Enriched"
+
+# Applying tau index filter to classify specific tissues
+genes_tissue_specifics <- subset(class_genes_tau, tau >= 0.8)
+
+#organizing tissue-enriched genes
+genes_tissue_specifics <- genes_tissue_specifics |>
+    filter((Group == "Tissue-Enriched")) |>
+    group_by(Gene)|>
+    summarise(
+        Specific_tissues = str_c(Tissue, collapse = "; ")
+    )
+
+# organizing group-enriched genes
+genes_group_specifics <- class_genes_tau |>
+    filter((Group == "Group-Enriched")) |>
+    group_by(Gene) |>
+    summarise(
+        Specific_tissues = str_c(Tissue, collapse = "; ")
+    )
+
+# join this into a df
+specific_genes_and_tissues_group <- dplyr::full_join(genes_tissue_specifics, genes_group_specifics)
+
+# Combine everything (classification + tissues) into a single data frame
+final_classified_genes <- class_genes_tau |>
+    dplyr::select(Gene, tau, Group) |>
+    distinct(Gene, .keep_all = TRUE) |>
+    left_join(specific_genes_and_tissues_group) |>
+    arrange(Group, Gene)
+
+  # change the Group column name to Classification
+  names(final_classified_genes)[3] <- "Classification"
+```
+
+- now we will join this classification data frame with the housekeeping and not expressed genes classes
+```{r}
+temp_hk <- data.frame("Gene" = row.names(genes_HK), "tau" = genes_HK$tau, "Classification" = "Housekepping")
+temp_nexpresso <- data.frame("Gene" = row.names(TPM_nexpresso), "Classification" = "Not-expressed")
+
+# genes with TPM >= 1 in at lest one sample but with median < 5 across tissues
+temp_low_expressed <- data.frame("Gene" = row.names(median_per_tissue[remove, ]), "Classification" = "Low_expressed")
+temp_low_expressed <- anti_join(temp_low_expressed, temp_nexpresso, by = "Gene")
+
+temp_exp_classes <- temp_hk |>
+    dplyr::select(Gene, tau, Classification) |>
+    distinct(Gene, .keep_all = TRUE) |>
+    full_join(temp_nexpresso) |>
+    full_join(temp_low_expressed) |>
+    arrange(Classification, Gene)
+```
+
+```{r}
+# removing from the df the genes that were previously classified as HK (here they were expressed-in-all)
+final_classified_genes <- anti_join(final_classified_genes, id_HK_genes, by = "Gene")
+
+# preparing the final df
+final_classified_genes <- final_classified_genes |>
+    dplyr::select(Gene, tau, Classification, Specific_tissues) |>
+    distinct(Gene, .keep_all = TRUE) |>
+    full_join(temp_exp_classes) |>
+    arrange(Classification, Gene)
+
+# Save object
+write.csv(
+    final_classified_genes,
+    file = "data/final_classified_genes.csv"
+)
+
+save(
+    final_classified_genes,
+    file = here::here(data, "data/final_classified_genes.rda"),
+    compress = "xz"
+)
+```
+
+
+```{r}
+# Exploring classification visually
+
+p_genes_per_class <- final_classified_genes |>
+    janitor::tabyl(Classification) |>
+    mutate(
+        Classification = fct_inorder(Classification),
+        Classification = reorder(Classification, -n)  
+    ) |>
+    ggplot(aes(x = n, y = Classification)) +
+    geom_bar(stat = "identity", fill = ggsci::pal_jama()(7)) +
+  
+    geom_text(aes(label = n), hjust = -0.2, size = 5) +  
+    theme_minimal() +
+    theme(
+       
+        text = element_text(size = 14, colour = "black"),
+        axis.text = element_text(size = 14, colour = "black"),
+        axis.title = element_text(size = 14, colour = "black"),
+        plot.title = element_text(size = 16, face = "bold", colour = "black"),
+         
+    ) +
+    labs(
+        title = "Number of genes per expression category",
+        x = "# of genes", y = ""
+    ) +
+    xlim(0, 15000)
+
+p_genes_per_class
+
+save(
+    p_genes_per_class,
+    file = here::here(data, "data/p_genes_per_class.rda"),
+    compress = "xz"
+)
+```
+
+- plot Tissue-enriched genes per tissue
+```{r}
+load("data/final_classified_genes.rda")
+te_genes_per_tissue <- final_classified_genes %>%
+  filter(!grepl("; ", Specific_tissues)) %>% #remove the group-enriched
+  na.omit(Specific_tissues)
+
+save(
+    te_genes_per_tissue,
+    file = here::here(data, "data/te_genes_per_tissue.rda"),
+    compress = "xz"
+)
+
+load("data/te_genes_per_tissue.rda")
+# plot
+p_TE_genes_per_tissue <- te_genes_per_tissue |>
+    tabyl(Specific_tissues) |>
+    mutate(
+        Specific_tissues = fct_inorder(Specific_tissues),
+        Specific_tissues = reorder(Specific_tissues, -n)  
+    ) |>
+
+ggplot(aes(x = n, y = Specific_tissues, fill = Specific_tissues)) +
+    geom_bar(stat = "identity") +
+    geom_text(aes(label = n), hjust = -0.2, size = 5) +
+     scale_fill_manual(values = annotation_colors_1$Tissue) +
+  guides(fill = FALSE) +
+    theme_minimal() +
+    theme(
+        text = element_text(size = 14, colour = "black"),
+        axis.text = element_text(size = 14, colour = "black"),
+        axis.title = element_text(size = 14, colour = "black"),
+        plot.title = element_text(size = 16, face = "bold", colour = "black"),
+    ) +
+    labs(
+        title = "Number of TE genes by tissue",
+        x = "# genes", y = ""
+    ) +
+    xlim(0, 1000) 
+
+p_TE_genes_per_tissue
+
+save(
+    p_TE_genes_per_tissue,
+    file = here::here(data, "data/p_TE_genes_per_tissue.rda"),
+    compress = "xz"
+)
+```
+
+Now, let's make an UpSet plot to see the patterns of body part specificity across genes.
+```{r}
+library(dplyr)
+# Create a list of body parts and their specific genes
+specific_genes_list <- final_classified_genes |>
+    dplyr::select(Gene, Specific_tissues) |>
+    mutate(Specific_tissues = str_to_title(Specific_tissues)) |>
+    separate_longer_delim(Specific_tissues, delim = "; ") |>
+    as.data.frame()
+
+specific_genes_list <- split(
+    specific_genes_list$Gene,
+    specific_genes_list$Specific_tissues
+)
+
+# Create a combination matrix and filter it
+comb_matrix <- make_comb_mat(specific_genes_list)
+sizes <- comb_size(comb_matrix)
+mat <- comb_matrix[sizes >= 10]
+degree <- comb_degree(mat)
+palette_1 <- ggsci::pal_npg()(length(unique(degree)))
+
+# plot
+p_upset_genes_class <- UpSet(
+    mat,
+    comb_col = palette_1[degree],
+    top_annotation = upset_top_annotation(
+        mat, add_numbers = TRUE, numbers_rot = 90, numbers_gp = gpar(fontsize = 14), annotation_name_gp = gpar(fontsize = 14)
+    ),
+    row_names_gp = gpar(fontsize = 14)
+) 
+
+p_upset_genes_class
+
+save(
+    p_upset_genes_class,
+    file = here::here(data, "data/p_upset_genes_class.rda"),
+    compress = "xz"
+)
+```
+
+We can also plot a heatmap of median expression profiles per tissue for all tissue-specific genes.
+
+```{r}
+# Create expression matrix to plot with metadata
+te_genes <- final_classified_genes |>
+    filter(Classification == "Tissue-Enriched") |>
+    pull(Gene)
+
+anot_te_median_heatmap <- data.frame("Tissue" = colnames(median_per_tissue))
+row.names(anot_te_median_heatmap) <- anot_te_median_heatmap$Tissue
+
+exp_matrix <- log2(median_per_tissue[te_genes, ] + 1)
+
+# Plot mean expression profiles with annotation per group
+p_heatmap_median <- pheatmap::pheatmap(
+    exp_matrix,
+    name = "Log2(TPM)",
+    main = "Median expression of tissue-enriched genes",
+    show_rownames = F,
+    show_colnames = F,
+    color = expression_palette,
+    cluster_rows = T,
+    cluster_cols = T,
+    annotation_col = anot_te_median_heatmap,
+    annotation_colors = annotation_colors_1,
+    fontsize = 14
+)
+
+p_heatmap_median
+
+save(
+    p_heatmap_median,
+    file = here::here(data, "data/p_heatmap_median.rda"),
+    compress = "xz"
+)
+```
+
+- violin plot
+```{r}
+# Filt the classes that not have Tau index
+violin_plot_data <- final_classified_genes |>
+  subset(Classification != "Low_expressed") |>
+  subset(Classification != "Not-expressed")
+
+#Plot
+p_violin_tau <- ggplot(violin_plot_data, aes(x = Classification, y = tau, fill = Classification)) +
+  geom_violin() +
+  scale_fill_manual(values= c("#374E55FF", "#DF8F44FF", "#00A1D5FF", "#B24745FF", "#79AF97FF")) +
+  geom_boxplot(width=0.08, fill="#f8f9f9") +
+  theme(
+        s
+        text = element_text(size = 14),
+        axis.text.x = element_blank(),
+        plot.title = element_text(size = 16, face = "bold") 
+    ) +
+   labs(
+    title = "Distribution of Tau index across classes"
+    )
+
+p_violin_tau
+
+save(
+    p_violin_tau,
+    file = here::here(data, "data/p_violin_tau.rda"),
+    compress = "xz"
+)
+```

@@ -1,0 +1,398 @@
+---
+title: "Cannabis Expression Atlas - Methods"
+author: "Kevelin Barbosa-Xavier, Francisnei Pedrosa-Silva, Fabricio Almeida-Silva, Thiago M. Venancio"
+date: "2024-08-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, warning = FALSE, message = FALSE)
+```
+
+## APP DATA ORGANIZATION
+Creating a directory with data for the Shiny app
+
+beasr package note: "Here, we will describe the code to create the files that will be required to
+run the Shiny app. These files will be stored in a directory named `app_data`.
+This parquet directory will be also needed in gene expression classification analysis." (Almeida-Silva, Pedrosa-Silva and Venancio, 2023).
+
+```{r here}
+set.seed(123) # for reproducibility
+
+# Load required packages
+library(here)
+library(SummarizedExperiment)
+library(arrow)
+library(tidyverse)
+library(rvest)
+```
+
+- choose the work directoy
+```{r echo = F}
+data <- "/media/winterfell/kevelin/doutorado/analises_JLmY_reference/CSEA_LATEST_08_2024/kevelin/"
+```
+```{r}
+data <- data <- "/your/path/here/"
+```
+
+## *.parquet* files in `parquet_dir`
+
+bears package note: "Gene-level transcript abundances in TPM and bias-corrected counts will be
+stored in a partitioned *.parquet* directory, so that expression data can be 
+accessed in the app back-end with Apache Arrow via the 
+`BiocStyle::CRANpkg("arrow")` package." (Almeida-Silva, Pedrosa-Silva and Venancio, 2023).
+
+This directory contains partitioned *.parquet* files with a gene expression 
+data frame in long format with the following variables:
+
+1. `Gene`: character, gene ID.
+2. `Sample`: character, sample name.
+3. `TPM`: numeric, gene-level transcript abundances in TPM.
+4. `Count`: numeric, gene-level transcript abundances in bias-corrected counts.
+5. `BioProject`: factor, BioProject IDs.
+6. `Tissue`: character, plant tissue.
+7. `Chemotype`: character, sample chemotype
+
+```{r gene_exp_parquet}
+# Get expression data in long format
+load("data/se_atlas_gene.rda")
+## TPM
+exp_tpm <- assay(se_atlas_gene, "gene_TPM") |>
+    reshape2::melt() |>
+    mutate(
+        Gene = as.character(Var1),
+        Sample = as.character(Var2),
+        TPM = as.numeric(value)
+    ) |>
+    dplyr::select(Gene, Sample, TPM)
+
+## Counts
+exp_counts <- assay(se_atlas_gene, "gene_counts") |>
+    reshape2::melt() |>
+    mutate(
+        Gene = as.character(Var1),
+        Sample = as.character(Var2),
+        Count = as.numeric(value)
+    ) |>
+    dplyr::select(Gene, Sample, Count)
+    
+
+## Combine data frames
+identical(exp_counts$Sample, exp_tpm$Sample)
+identical(exp_counts$Gene, exp_tpm$Gene)
+exp_final <- cbind(exp_tpm, exp_counts[, "Count", drop = FALSE])
+
+# Export data with BioProject and Tissue info
+sample_metadata <- colData(se_atlas_gene) |>
+    as.data.frame() |>
+    tibble::rownames_to_column("BioSample")
+
+sample_and_additional_info <- data.frame(
+    Sample = sample_metadata$BioSample,
+    BioProject = sample_metadata$BioProject,
+    Tissue = sample_metadata$Tissue
+)
+
+exp_final2 <- dplyr::left_join(
+    exp_final, 
+    sample_and_additional_info
+) |>
+    mutate(
+        BioProject = as.factor(BioProject),
+        Sample = as.factor(Sample),
+        Tissue = as.factor(Tissue)
+    )
+
+
+parquet_dir_partitioned <- "data/app_data/parquet_dir"
+
+fs::dir_create(parquet_dir_partitioned)
+
+arrow::write_dataset(
+    exp_final2, 
+    path = parquet_dir_partitioned,
+    format = "parquet",
+    partitioning = c("BioProject", "Tissue")
+)
+```
+
+## `expression_by_tissue/` directory
+
+bears package note: "This directory contains static `.tsv` files with gene expression information
+by tissue, and it is used by the "Download by tissue" tab to avoid
+having to load large volumes of data in memory, which is problematic when there
+are too many users." (Almeida-Silva, Pedrosa-Silva and Venancio, 2023).
+
+- First, let's export gene-level abundances.
+```{r}
+# Get a list of character vectors with samples per tissue
+samples_per_tissue <- colData(se_atlas_gene) |>
+    as.data.frame() |>
+    tibble::rownames_to_column("BioSample")
+
+samples_per_tissue <- split(
+    samples_per_tissue$BioSample, samples_per_tissue$Tissue
+)
+
+# Get expression data frames in TPM
+tpm <- assay(se_atlas_gene, "gene_TPM")
+tpm_matrices <- lapply(samples_per_tissue, function(x) {
+    
+    return(tpm[, x] |> as.data.frame() |> tibble::rownames_to_column("Gene"))
+    
+})
+
+# Get expression data frames in counts
+counts <- assay(se_atlas_gene, "gene_counts")
+count_matrices <- lapply(samples_per_tissue, function(x) {
+    
+    return(counts[, x] |> as.data.frame() |> tibble::rownames_to_column("Gene"))
+    
+})
+
+# Export data to .tsv files
+outdir <- "data/app_data/expression_by_tissue"
+if(!dir.exists(outdir)) { dir.create(outdir, recursive = TRUE) }
+
+invisible(lapply(seq_along(count_matrices), function(x) {
+    
+    tissue <- names(count_matrices)[x]
+    file <- file.path(outdir, paste0(tissue, "_count.tsv"))
+    
+    w <- readr::write_tsv(
+        count_matrices[[x]], 
+        file = file
+    )
+    return(w)
+}))
+
+invisible(lapply(seq_along(tpm_matrices), function(x) {
+    
+    tissue <- names(tpm_matrices)[x]
+    file <- file.path(outdir, paste0(tissue, "_TPM.tsv"))
+    
+    w <- readr::write_tsv(
+        tpm_matrices[[x]], 
+        file = file
+    )
+    return(w)
+}))
+```
+
+- Now, we will export transcript-level abundances.
+
+```{r}
+load("data/se_atlas_transcript_2.rda")
+
+# Get expression data frames in TPM
+tpm <- assay(se_atlas_transcript_2, "tx_TPM")
+tpm_matrices <- lapply(samples_per_tissue, function(x) {
+    
+    return(
+        tpm[, x] |> 
+            as.data.frame() |> 
+            tibble::rownames_to_column("Transcript")
+    )
+    
+})
+
+# Get expression data frames in counts
+counts <- assay(se_atlas_transcript_2, "tx_counts")
+count_matrices <- lapply(samples_per_tissue, function(x) {
+    
+    return(
+        counts[, x] |> 
+            as.data.frame() |> 
+            tibble::rownames_to_column("Transcript")
+    )
+    
+})
+
+
+# Export data to .tsv files
+outdir <- "data/app_data/expression_by_tissue"
+if(!dir.exists(outdir)) { dir.create(outdir, recursive = TRUE) }
+
+invisible(lapply(seq_along(count_matrices), function(x) {
+    
+    tissue <- names(count_matrices)[x]
+    file <- file.path(outdir, paste0(tissue, "_count_tx.tsv"))
+    
+    w <- readr::write_tsv(
+        count_matrices[[x]], 
+        file = file
+    )
+    return(w)
+}))
+
+invisible(lapply(seq_along(tpm_matrices), function(x) {
+    
+    tissue <- names(tpm_matrices)[x]
+    file <- file.path(outdir, paste0(tissue, "_TPM_tx.tsv"))
+    
+    w <- readr::write_tsv(
+        tpm_matrices[[x]], 
+        file = file
+    )
+    return(w)
+}))
+```
+
+
+### Essential files to the atlas
+
+#### parquet_dir
+
+#### CEA_annotation_latest
+
+#### tsne_coordinates
+
+#### project_metadata
+- This object stores metadata at the BioProject level.
+```{r}
+library(htmltools)
+
+create_project_table <- function(metadata = NULL) {
+  table <- metadata %>%
+    dplyr::filter(startsWith(BioProject, "PRJ")) %>%
+    dplyr::add_count(BioProject) %>%
+    dplyr::select(BioProject, n, Study_title, Study_abstract) %>%
+    dplyr::rename(
+      N_samples = n, 
+      `Study title` = Study_title,
+      `Study abstract` = Study_abstract
+    ) %>%
+    dplyr::distinct()
+  
+  tissue_count <- metadata %>%
+    dplyr::filter(startsWith(BioProject, "PRJ")) %>%
+    group_by(BioProject, Tissue) %>%
+    summarise(n = n()) %>%
+    ungroup() %>%
+    arrange(-n) %>%
+    group_by(BioProject) %>%
+    summarise(
+      Tissue = stringr::str_c(Tissue, ": ", n, collapse = " | ")
+    )
+  
+  cultivar_count <- metadata %>%
+    dplyr::filter(startsWith(BioProject, "PRJ")) %>%
+    group_by(BioProject, Cultivar) %>%
+    summarise(n = n()) %>%
+    ungroup() %>%
+    arrange(-n) %>%
+    group_by(BioProject) %>%
+    summarise(
+      Cultivar = stringr::str_c(Cultivar, ": ", n, collapse = " | ")
+    )
+  type_count <- metadata %>%
+    dplyr::filter(startsWith(BioProject, "PRJ")) %>%
+    group_by(BioProject, Chemotype) %>%
+    summarise(n = n()) %>%
+    ungroup() %>%
+    arrange(-n) %>%
+    group_by(BioProject) %>%
+    summarise(
+      Chemotype = stringr::str_c(Chemotype, ": ", n, collapse = " | ")
+    )
+  
+  final_table <- dplyr::inner_join(
+    table, tissue_count, by = "BioProject"
+  ) %>%
+    dplyr::inner_join(
+      ., cultivar_count, by = "BioProject"
+    ) %>%
+    dplyr::inner_join(
+      ., type_count, by = "BioProject"
+    ) %>%
+    dplyr::select(
+      BioProject, N_samples, Tissue, Cultivar, Chemotype, `Study title`, `Study abstract`
+    )
+  
+  return(final_table)
+}
+
+# Combine sample metadata into project metadata
+load("data/sample_metadata_new.rda")
+project_metadata <- create_project_table(sample_metadata_new)
+
+# Create a data frame with PMID and DOI of publications associated with projects
+all_bioprojects <- unique(project_metadata$BioProject)
+
+pub_info <- Reduce(rbind, lapply(all_bioprojects, function(x) {
+  message(x)
+  pubs <- read_html(
+    paste0("https://www.ncbi.nlm.nih.gov/bioproject/?term=", x)
+  ) |>
+    html_nodes(".RegularLink") |>
+    html_attr("href")
+  
+  # Get PMID
+  pmid <- pubs[grepl("/pubmed/", pubs)]
+  pmid <- unique(gsub("/pubmed/", "", pmid))
+  
+  id_table <- NULL
+  if(length(pmid) != 0) {
+    # Use PMID to extract DOI
+    doi <- sapply(pmid, function(y) {
+      d <- read_html(
+        paste0("https://pubmed.ncbi.nlm.nih.gov/", y)
+      ) |>
+        html_nodes("a") |>
+        html_attr("href")
+      
+      d <- unique(d[grepl("doi\\.org/", d)])[1]
+      return(d)
+    })
+    
+    id_table <- data.frame(
+      BioProject = x,
+      PMID = pmid,
+      DOI = doi
+    )
+  }
+  
+  return(id_table)
+}))
+
+pub_table <- pub_info |>
+  mutate(DOI = str_replace_all(DOI, "https://doi.org/", "")) |>
+  group_by(BioProject) |>
+  summarise(
+    DOI = paste0(DOI, collapse = ", "),
+    PMID = paste0(PMID, collapse = ", ")
+  ) |>
+  mutate(
+    DOI = as.factor(DOI),
+    PMID = as.factor(PMID)
+  )
+
+pmeta <- left_join(project_metadata, pub_info, by = "BioProject") |>
+  dplyr::select(
+    BioProject, N_samples, Tissue, Cultivar, Chemotype, `Study title`, DOI, PMID, `Study abstract`
+  )
+
+project_metadata <- pmeta
+# It was not possible to obtain all PMIDs or DOIs by this method, so for the missing bioprojects a manual curation was done to collect the information, if it existed.
+# then the df was saved as csv and edited by hand.
+write.csv(project_metadata,
+          file = here(data, "data/project_metadata.csv"))
+
+# load the final table
+
+library(readr)
+project_metadata <- read_csv("data/project_metadata.csv")
+View(project_metadata)
+
+# Save object
+save(
+    project_metadata, compress = "xz",
+    file = here(data, "data/project_metadata.rda")
+)
+```
+
+#### sample metadata
+```{r}
+load("data/sample_metadata_new.rda")
+```
+
