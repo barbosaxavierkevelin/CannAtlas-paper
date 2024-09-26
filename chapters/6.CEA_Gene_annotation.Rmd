@@ -1,0 +1,742 @@
+---
+title: "Cannabis Expression Atlas - Methods"
+author: "Kevelin Barbosa-Xavier, Francisnei Pedrosa-Silva, Fabricio Almeida-Silva,
+  Thiago M. Venancio"
+date: "2024-08-22"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r echo = FALSE, fig.align='center'}
+data <- "/media/winterfell/kevelin/doutorado/analises_JLmY_reference/CSEA_LATEST_08_2024/kevelin/"
+```
+```{r}
+# choose the work directoy
+data <- "/your/path/here/"
+```
+
+## **Gene functional annotation analysis**
+
+### **Step 1:** InterProScan prediction
+
+- Following InterProScan doccumentation
+
+#### - Checking if you are at the conda interpro env
+```{bash}
+conda info --envs
+```
+
+#### - Checking sistem requirements
+```{bash}
+# Linux version is 64px?
+uname -a
+
+# Perl 5 is installed?
+perl -version
+
+# Python 3 is installed?
+python3 --version
+
+# java 11 is installed?
+java -version
+```
+
+#### - Install InterProScan software
+```{bash}
+# create a work directory
+mkdir my_interproscan
+cd my_interproscan
+wget https://ftp.ebi.ac.uk/pub/software/unix/iprscan/5/5.69-101.0/interproscan-5.69-101.0-64-bit.tar.gz
+wget https://ftp.ebi.ac.uk/pub/software/unix/iprscan/5/5.69-101.0/interproscan-5.69-101.0-64-bit.tar.gz.md5
+
+# Recommended checksum to confirm the download was successful:
+md5sum -c interproscan-5.69-101.0-64-bit.tar.gz.md5
+# Must return *interproscan-5.69-101.0-64-bit.tar.gz: OK*
+# If not - try downloading the file again as it may be a corrupted copy.
+```
+
+```{bash}
+# unzip the interproscan
+tar -pxvzf interproscan-5.69-101.0-*-bit.tar.gz
+
+# where:
+#     p = preserve the file permissions
+#     x = extract files from an archive
+#     v = verbosely list the files processed
+#     z = filter the archive through gzip
+#     f = use archive file
+cd interproscan-5.69-101.0/
+```
+
+```{bash}
+# Index hmm models
+# Before you run interproscan for the first time, you should run the command:
+python3 setup.py -f interproscan.properties
+# This command will press and index the hmm models to prepare them into a format used by hmmscan.
+```
+
+#### - Running InterProScan
+```{bash}
+# run analysis to a aminoacid db
+./interproscan.sh -i CSEA_DB_sequences.fasta -cpu 40 -goterms -pa
+```
+
+#### - Results
+```{bash}
+cd ./interproscan-5.69-101.0/CEA_interpro_results/
+```
+
+- Import the InterProScan results table
+```{r}
+library(readr)
+CSEA_DB_sequences_fasta <- read_delim("../my_interproscan/interproscan-5.69-101.0/CEA_interpro_results/CSEA_DB_sequences.fasta.tsv", 
+    delim = "\t", escape_double = FALSE, 
+    col_names = FALSE, trim_ws = TRUE)
+View(CSEA_DB_sequences_fasta)
+```
+
+- rename colnames
+```{r}
+colnames(CSEA_DB_sequences_fasta) <- c("GeneID", "Sequence_MD5", "Sequence_length", "Analysis_DB", "Signature_acession", "Signature_description", "Start", "Stop", "e-value", "Status", "Date", "InterPro_acession", "InterPro_description", "GO_annotations", "Pathway_annotations")
+```
+
+- cat just the informative columns
+```{r}
+CEA_annotation_interpro <- data.frame("GeneID" = CSEA_DB_sequences_fasta$GeneID, "Analysis_DB" = CSEA_DB_sequences_fasta$Analysis_DB, "Signature_acession" = CSEA_DB_sequences_fasta$Signature_acession, "Signature_description" = CSEA_DB_sequences_fasta$Signature_description, "InterPro_acession" = CSEA_DB_sequences_fasta$InterPro_acession, "InterPro_description" = CSEA_DB_sequences_fasta$InterPro_description, "GO_annotations" = CSEA_DB_sequences_fasta$GO_annotations, "Pathway_annotations" = CSEA_DB_sequences_fasta$Pathway_annotations)
+```
+
+```{r}
+CEA_annotation_interpro[CEA_annotation_interpro == "-"] <- NA
+```
+
+- group info by geneid
+Here we will group all the information of a gene, to avoid duplicated lines into the df.
+```{r}
+library(dplyr)
+CEA_annotation_interpro <- CEA_annotation_interpro %>%
+  group_by(GeneID) %>%
+  summarise(
+    Analysis_DB = paste(unique(na.omit(Analysis_DB)), collapse = "; "),
+    Signature_acession = paste(unique(na.omit(Signature_acession)), collapse = "; "),
+    Signature_description = paste(unique(na.omit(Signature_description)), collapse = "; "),
+    InterPro_acession = paste(unique(na.omit(InterPro_acession)), collapse = "; "),
+    InterPro_description = paste(unique(na.omit(InterPro_description)), collapse = "; "),
+    GO_annotations = paste(unique(na.omit(GO_annotations)), collapse = "; "),
+    Pathway_annotations = paste(unique(na.omit(Pathway_annotations)), collapse = "; ")
+  )
+
+save(
+    CEA_annotation_interpro,
+    file = here::here(data, "data/CEA_annotation_interpro.rda"),
+    compress = "xz"
+)
+```
+
+### **Step 2:** UniprotID mapping analysis
+- We use the ID mapping tool into the UniProt database to perform a second gene annotation analysis.
+This information will be used together with the annotation performed using InterProScan db.
+
+- load the UniProt ID mapping results
+```{r}
+library(readr)
+CEA_UNIPROT_idmapping_2024_08_13 <- read_delim("/your/file/path/CEA_UNIPROT_idmapping_2024_08_13.tsv", 
+    delim = "\t", escape_double = FALSE, 
+    trim_ws = TRUE)
+View(CEA_UNIPROT_idmapping_2024_08_13)
+
+names(CEA_UNIPROT_idmapping_2024_08_13)[1] <- "GeneID"
+```
+
+```{r echo = F}
+library(readr)
+CEA_UNIPROT_idmapping_2024_08_13 <- read_delim("/media/winterfell/kevelin/doutorado/analises_JLmY_reference/CSEA_LATEST_08_2024/CEA_UNIPROT_idmapping_2024_08_13.tsv", 
+    delim = "\t", escape_double = FALSE, 
+    trim_ws = TRUE)
+View(CEA_UNIPROT_idmapping_2024_08_13)
+
+names(CEA_UNIPROT_idmapping_2024_08_13)[1] <- "GeneID"
+```
+
+- Getting interest informations
+```{r}
+CEA_UNIPROT <- data.frame("GeneID" = CEA_UNIPROT_idmapping_2024_08_13$GeneID, "Entry_name" = CEA_UNIPROT_idmapping_2024_08_13$`Entry Name`, "Protein_name" = CEA_UNIPROT_idmapping_2024_08_13$`Protein names`, "Gene_Onthology" = CEA_UNIPROT_idmapping_2024_08_13$`Gene Ontology (GO)`)
+```
+
+#### - Join informations by InterProScan and UniProt ID mapping
+```{r}
+CEA_annotation_latest <- dplyr::full_join(CEA_UNIPROT, CEA_annotation_interpro, by = "GeneID")
+```
+
+#### - filter by atlas genes
+
+We need to do it because we use the complete CDS file of the reference (Jamaican Lion mother + Y) to perform the InterProScan and UniProt ID mapping analys, now we need to preserve just the information for the genes effectively quantified by SALMON, the CEA genes.
+```{r}
+load("data/se_atlas_gene.rda")
+
+genes_CEA <- data.frame("GeneID" = names(se_atlas_gene)) 
+
+CEA_annotation_latest <- dplyr::left_join(genes_CEA, CEA_annotation_latest, by = "GeneID")
+```
+
+### **Step 3:** KEGG pathway annotation
+We also perform pathway annotation by using GhostKoala tool at the Kegg database.
+
+- Load GhostKoala results
+```{r echo = F}
+library(readr)
+user_ko_definition <- read_delim("/media/winterfell/kevelin/doutorado/analises_JLmY_reference/CSEA_LATEST_08_2024/user_ko_definition.txt", 
+    delim = "\t", escape_double = FALSE, 
+    col_names = FALSE, col_types = cols(X4 = col_skip(), 
+        X5 = col_skip(), X6 = col_skip()), 
+    trim_ws = TRUE)
+View(user_ko_definition)
+
+names(user_ko_definition)[1:3] <- c("Protein", "Entry_KEGG", "Definition_KEGG")
+
+head(user_ko_definition)
+```
+```{r}
+library(readr)
+user_ko_definition <- read_delim("/your/path/file/user_ko_definition.txt", 
+    delim = "\t", escape_double = FALSE, 
+    col_names = FALSE, col_types = cols(X4 = col_skip(), 
+        X5 = col_skip(), X6 = col_skip()), 
+    trim_ws = TRUE)
+View(user_ko_definition)
+
+names(user_ko_definition)[1:3] <- c("Protein", "Entry_KEGG", "Definition_KEGG")
+
+head(user_ko_definition)
+```
+
+```{r}
+Ko_id <- unique(user_ko_definition$Entry_KEGG)
+Ko_id <- Ko_id[!is.na(Ko_id)]
+```
+
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("KEGGREST")
+
+library(KEGGREST)
+```
+
+```{r}
+ko_ids <- Ko_id
+# Loop sobre os IDs para obter informações de cada KO
+ko_info <- list()
+
+for (ko_id in ko_ids) {
+  ko_info[[ko_id]] <- tryCatch(keggGet(organism_list, ko_id), error=function(e) NULL)
+  options(timeout = 600000)
+}
+
+save(
+    ko_info,
+    file = here::here(data, "data/ko_info.rda"),
+    compress = "xz"
+)
+
+load("data/ko_info.rda")
+```
+
+```{r}
+# Initialize an empty data frame
+PATH_INFO <- data.frame(Entry_KEGG = character(0), PATHWAY_KEGG = character(0), MODULE_KEGG = character(0))
+
+# Use sapply to extract the information for each ID
+for (ko_id in ko_ids) {
+  entry <- ko_info[[ko_id]][[1]][["ENTRY"]]
+  
+  # Check if PATHWAY exists, otherwise set to NA
+  if ("PATHWAY" %in% names(ko_info[[ko_id]][[1]])) {
+    pathways <- ko_info[[ko_id]][[1]][["PATHWAY"]]
+    if (length(pathways) > 1) {
+      pathway <- paste(pathways, collapse = "; ")
+    } else {
+      pathway <- pathways
+    }
+  } else {
+    pathway <- NA
+  }
+  
+   #Check if MODULE exists, otherwise set to NA
+  if ("MODULE" %in% names(ko_info[[ko_id]][[1]])) {
+    modules <- ko_info[[ko_id]][[1]][["MODULE"]]
+    if (length(modules) > 1) {
+      module <- paste(modules, collapse = "; ")
+    } else {
+      module <- modules
+    }
+  } else {
+    module <- NA
+  }
+  
+  # Create a new record and add it to the data frame
+  novo_registro <- data.frame(Entry_KEGG = entry, PATHWAY_KEGG = pathway, MODULE_KEGG = module)
+  PATH_INFO <- rbind(PATH_INFO, novo_registro)
+}
+```
+
+- Removing pathways related to humam diseases and organismal systems
+I ran kegg mapper and created a list of paths to remove from my data because this can cause confusion for CEA users.
+```{r}
+# Create a list of the routes you want to remove
+vias_para_remover <- c(
+  "Immune system",
+  "Platelet activation",
+  "Neutrophil extracellular trap formation",
+  "Toll-like receptor signaling pathway",
+  "Toll and Imd signaling pathway",
+  "NOD-like receptor signaling pathway",
+  "RIG-I-like receptor signaling pathway",
+  "Cytosolic DNA-sensing pathway",
+  "C-type lectin receptor signaling pathway",
+  "Natural killer cell mediated cytotoxicity",
+  "Antigen processing and presentation",
+  "T cell receptor signaling pathway",
+  "Th1 and Th2 cell differentiation",
+  "Th17 cell differentiation",
+  "IL-17 signaling pathway",
+  "B cell receptor signaling pathway",
+  "Fc epsilon RI signaling pathway",
+  "Fc gamma R-mediated phagocytosis",
+  "Leukocyte transendothelial migration",
+  "Chemokine signaling pathway",
+  "Insulin secretion",
+  "Insulin signaling pathway",
+  "Glucagon signaling pathway",
+  "Regulation of lipolysis in adipocytes",
+  "Adipocytokine signaling pathway",
+  "PPAR signaling pathway",
+  "GnRH secretion",
+  "GnRH signaling pathway",
+  "Ovarian steroidogenesis",
+  "Estrogen signaling pathway",
+  "Progesterone-mediated oocyte maturation",
+  "Prolactin signaling pathway",
+  "Oxytocin signaling pathway",
+  "Relaxin signaling pathway",
+  "Growth hormone synthesis, secretion and action",
+  "Thyroid hormone synthesis",
+  "Thyroid hormone signaling pathway",
+  "Parathyroid hormone synthesis, secretion and action",
+  "Melanogenesis",
+  "Renin secretion",
+  "Renin-angiotensin system",
+  "Aldosterone synthesis and secretion",
+  "Cardiac muscle contraction",
+  "Adrenergic signaling in cardiomyocytes",
+  "Vascular smooth muscle contraction",
+  "Salivary secretion",
+  "Gastric acid secretion",
+  "Pancreatic secretion",
+  "Bile secretion",
+  "Carbohydrate digestion and absorption",
+  "Protein digestion and absorption",
+  "Fat digestion and absorption",
+  "Cholesterol metabolism",
+  "Vitamin digestion and absorption",
+  "Cobalamin transport and metabolism",
+  "Mineral absorption",
+  "Vasopressin-regulated water reabsorption",
+  "Aldosterone-regulated sodium reabsorption",
+  "Endocrine and other factor-regulated calcium reabsorption",
+  "Proximal tubule bicarbonate reclamation",
+  "Collecting duct acid secretion",
+  "Glutamatergic synapse",
+  "GABAergic synapse",
+  "Cholinergic synapse",
+  "Dopaminergic synapse",
+  "Serotonergic synapse",
+  "Long-term potentiation",
+  "Long-term depression",
+  "Retrograde endocannabinoid signaling",
+  "Synaptic vesicle cycle",
+  "Neurotrophin signaling pathway",
+  "Phototransduction",
+  "Phototransduction - fly",
+  "Olfactory transduction",
+  "Taste transduction",
+  "Inflammatory mediator regulation of TRP channels",
+  "Dorso-ventral axis formation",
+  "Axon guidance",
+  "Axon regeneration",
+  "Osteoclast differentiation",
+  "Longevity regulating pathway",
+  "Longevity regulating pathway - worm",
+  "Longevity regulating pathway - multiple species",
+  "Circadian rhythm",
+  "Circadian entrainment",
+  "Circadian rhythm - fly",
+  "Thermogenesis",
+  "Pathways in cancer",
+  "Transcriptional misregulation in cancer",
+  "MicroRNAs in cancer",
+  "Proteoglycans in cancer",
+  "Chemical carcinogenesis - DNA adducts",
+  "Chemical carcinogenesis - receptor activation",
+  "Chemical carcinogenesis - reactive oxygen species",
+  "Viral carcinogenesis",
+  "Central carbon metabolism in cancer",
+  "Choline metabolism in cancer",
+  "PD-L1 expression and PD-1 checkpoint pathway in cancer",
+  "Colorectal cancer",
+  "Pancreatic cancer",
+  "Hepatocellular carcinoma",
+  "Gastric cancer",
+  "Glioma",
+  "Thyroid cancer",
+  "Acute myeloid leukemia",
+  "Chronic myeloid leukemia",
+  "Basal cell carcinoma",
+  "Melanoma",
+  "Renal cell carcinoma",
+  "Bladder cancer",
+  "Prostate cancer",
+  "Endometrial cancer",
+  "Breast cancer",
+  "Small cell lung cancer",
+  "Non-small cell lung cancer",
+  "Human T-cell leukemia virus 1 infection",
+  "Human immunodeficiency virus 1 infection",
+  "Hepatitis B",
+  "Hepatitis C",
+  "Coronavirus disease - COVID-19",
+  "Influenza A",
+  "Measles",
+  "Herpes simplex virus 1 infection",
+  "Human cytomegalovirus infection",
+  "Kaposi sarcoma-associated herpesvirus infection",
+  "Epstein-Barr virus infection",
+  "Human papillomavirus infection",
+  "Vibrio cholerae infection",
+  "Epithelial cell signaling in Helicobacter pylori infection",
+  "Pathogenic Escherichia coli infection",
+  "Salmonella infection",
+  "Shigellosis",
+  "Yersinia infection",
+  "Pertussis",
+  "Legionellosis",
+  "Tuberculosis",
+  "Bacterial invasion of epithelial cells",
+  "Amoebiasis",
+  "Toxoplasmosis",
+  "Leishmaniasis",
+  "Chagas disease",
+  "African trypanosomiasis",
+  "Systemic lupus erythematosus",
+  "Rheumatoid arthritis",
+  "Primary immunodeficiency",
+  "Alzheimer disease",
+  "Parkinson disease",
+  "Amyotrophic lateral sclerosis",
+  "Huntington disease",
+  "Spinocerebellar ataxia",
+  "Prion disease",
+  "Pathways of neurodegeneration - multiple diseases",
+  "Cocaine addiction",
+  "Amphetamine addiction",
+  "Morphine addiction",
+  "Nicotine addiction",
+  "Alcoholism",
+  "Lipid and atherosclerosis",
+  "Fluid shear stress and atherosclerosis",
+  "Hypertrophic cardiomyopathy",
+  "Arrhythmogenic right ventricular cardiomyopathy",
+  "Dilated cardiomyopathy",
+  "Diabetic cardiomyopathy",
+  "Viral myocarditis",
+  "Type II diabetes mellitus",
+  "Type I diabetes mellitus",
+  "Alcoholic liver disease",
+  "Non-alcoholic fatty liver disease",
+  "Insulin resistance",
+  "AGE-RAGE signaling pathway in diabetic complications",
+  "Cushing syndrome",
+  "Vancomycin resistance",
+  "EGFR tyrosine kinase inhibitor resistance",
+  "Platinum drug resistance",
+  "Antifolate resistance",
+  "Endocrine resistance"
+)
+
+# Function to remove specified paths
+remove_vias <- function(pathways) {
+  pathway_list <- unlist(strsplit(pathways, "; "))
+  pathway_list <- pathway_list[!pathway_list %in% vias_para_remover]
+  paste(pathway_list, collapse = "; ")
+}
+
+# Apply the function to the PATHWAY_KEGG column
+PATH_INFO$PATHWAY_KEGG <- sapply(PATH_INFO$PATHWAY_KEGG, remove_vias)
+
+print(PATH_INFO)
+save(
+    PATH_INFO,
+    file = here::here(data, "data/PATH_INFO.rda"),
+    compress = "xz"
+)
+```
+
+```{r}
+pathway_enrichment_df <- user_ko_definition
+pathway_enrichment_df <- dplyr::full_join(pathway_enrichment_df, PATH_INFO, by = "Entry_KEGG")
+names(pathway_enrichment_df)[1] <- "GeneID"
+
+pathway_enrichment_df <- inner_join(pathway_enrichment_df, genes_CEA, by = "GeneID")
+
+save(
+    pathway_enrichment_df,
+    file = here::here(data, "data/pathway_enrichment_df.rda"),
+    compress = "xz"
+)
+```
+
+###  **Step 4:** Transcription factor prediction
+we performed transcription factor (TF) prediction using PlantTFDB v5.0 (Tian et al., 2020) for all genes in our database.
+
+```{r}
+# IMPORT PlantTFDB RESULT
+library(readr)
+CEA_TF_list <- read_delim("data/CEA_TF_list.txt", 
+    delim = "\t", escape_double = FALSE, 
+    col_names = FALSE, trim_ws = TRUE)
+View(CEA_TF_list)
+```
+
+```{r}
+names(CEA_TF_list) <- c("GeneID", "TF family")
+head(CEA_TF_list)
+
+CEA_TF_list <- inner_join(CEA_TF_list, genes_CEA, by = "GeneID")
+```
+Considering it, we identify 1489 TF genes at the cannabis expression atlas.
+
+```{r}
+n_tf <- CEA_TF_list %>%
+  group_by(`TF family`) %>%
+  summarise(n = n()) %>%
+  arrange(-n) %>%
+  mutate(
+    `TF family` = factor(`TF family`, levels = unique(`TF family`))
+  )
+
+n_genes_by_TF_family <- data.frame("Tf family" = n_tf$`TF family`, "# Genes" = n_tf$n)
+
+names(n_genes_by_TF_family) <- c("TF family", "# Genes")
+
+save(
+    n_genes_by_TF_family,
+    file = here::here(data, "data/n_genes_by_TF_family.rda"),
+    compress = "xz"
+)
+
+write_csv(n_genes_by_TF_family,
+     file = here::here(data, "data/n_genes_by_TF_family.csv"))
+
+load("data/n_genes_by_TF_family.rda")
+# Plot data
+p_tf_genes <- ggplot(
+    n_tf, aes(x = n, y = `TF family`)
+) +
+    geom_bar(stat = "identity", fill = "#053D38") +
+    geom_text(aes(label = n), hjust = -0.4, size = 4) +  
+    theme_minimal() +
+    theme(
+        text = element_text(size = 14, colour = "black"),
+        axis.text = element_text(size = 14, colour = "black"),
+        axis.title = element_text(size = 14),
+        plot.title = element_text(size = 16, face = "bold") 
+    ) +
+    labs(
+        x = "Genes", y = "",
+        title = "Number of genes per TF family"
+    ) #+
+    #scale_x_continuous(limits = c(0, 161))
+
+p_tf_genes
+
+# Save plot to file
+save(
+    p_samples_per_Tissue, compress = "xz",
+    file = here(data, "data/p_samples_per_Tissue.rda")
+)
+```
+
+### **Step 5:** Join all informatins in a unique df
+```{r}
+load("/data/CEA_annotation_latest")
+CEA_annotation_latest <- dplyr::left_join(CEA_annotation_latest, pathway_enrichment_df, by = "GeneID")
+```
+
+```{r}
+#removing some confuse collumns
+CEA_annotation_latest$Analysis_DB <- NULL
+CEA_annotation_latest$Signature_acession <- NULL
+CEA_annotation_latest$Signature_description <- NULL
+```
+
+```{r}
+#Rename the columns
+names(CEA_annotation_latest) <- c("GeneID", "Entry(UniProt)", "Protein name(UniProt)", "Gene Ontology(UniProt)", "Acession(InterPro)", "Description(InterPro)", "Gene Ontology(InterPro)", "Pathway annotations(InterPro)", "Entry(KEGG)", "Definition(KEGG)", "Pathway(KEGG)", "Module(KEGG)")
+CEA_annotation_latest <- as.data.frame(CEA_annotation_latest)
+names(CEA_annotation_latest)[16] <- "Entry(KEGG)"
+```
+
+```{r}
+# Create a Description column to join informations. 
+
+#If the value in the Protein name(UniProt) column is Uncharacterized protein, change it to the value in the Description(InterPro) column, if not, keep the value in the Protein name(UniProt) column.
+temp <- ifelse(CEA_annotation_latest$`Protein name(UniProt)` == "Uncharacterized protein",
+               CEA_annotation_latest$`Description(InterPro)`,
+               CEA_annotation_latest$`Protein name(UniProt)`)
+
+CEA_annotation_latest$Description <- temp
+
+
+# if the value in the Description column is EMPTY, replace it with the value from the Definition(KEGG) column, OTHERWISE, KEEP THE DESCRIPTION VALUE
+temp <- ifelse(CEA_annotation_latest$Description == "",
+               CEA_annotation_latest$`Definition(KEGG)`,
+               CEA_annotation_latest$Description
+               )
+
+CEA_annotation_latest$Description <- temp
+
+# If the value in Description is NA after that, it is because the information for it is not in any database, so the cell will receive the value from the Protein name (UniProt) column, which will be: Uncharacterized protein
+temp <- ifelse(is.na(CEA_annotation_latest$Description),
+               CEA_annotation_latest$`Protein name(UniProt)`,
+               CEA_annotation_latest$Description
+               )
+
+CEA_annotation_latest$Description <- temp
+```
+
+```{r}
+names(CEA_annotation_latest)[3] <- "Description(UniProt)"
+```
+
+```{r}
+CEA_annotation_latest <- left_join(CEA_annotation_latest, CEA_TF_list, by = "GeneID")
+names(CEA_annotation_latest)[1] <- "Gene"
+```
+
+- Join if calculated informations for each gene
+
+```{r}
+load("data/final_classified_genes.rda")
+```
+
+```{r}
+CEA_annotation_latest <- left_join(CEA_annotation_latest, final_classified_genes, by = "Gene")
+```
+
+All the genes that starsts with "G" are from the Y contig.
+```{r}
+CEA_annotation_latest$`Y Gene` <- NA
+
+# Selecting the desired rows and modifying the "Y Gene" column
+CEA_annotation_latest[27106:27640, 'Y Gene'] <- rep("Y Gene", 535)
+```
+
+- joining the CDS ID (Protein ID) information of the reference genome
+```{r}
+load("data/prot2gene2.rda")
+names(prot2gene2)[1] <- "ProteinID"
+names(prot2gene2)[2] <- "Gene"
+
+CEA_annotation_latest <- left_join(CEA_annotation_latest, prot2gene2, by = "Gene")
+```
+
+```{r}
+# Defining the new order (adjust as needed)
+new_order <- c("Gene", "ProteinID", "Description", "Classification", "Specific_tissues", 
+               "TF family", "Y Gene", "tau", "Entry(UniProt)", "Description(UniProt)", 
+               "Gene Ontology(UniProt)", "Acession(InterPro)", "Description(InterPro)", 
+               "Gene Ontology(InterPro)", "Pathway annotations(InterPro)", "Entry(KEGG)",
+               "Definition(KEGG)", "Pathway(KEGG)", "Module(KEGG)")
+
+
+
+# Reorganizing the dataframe
+CEA_annotation_latest <- CEA_annotation_latest[, new_order]
+names(CEA_annotation_latest)[1] <- "GeneID"
+names(CEA_annotation_latest)[5] <- "Specific tissues"
+names(CEA_annotation_latest)[8] <- "Tau"
+
+CEA_annotation_latest$Classification[CEA_annotation_latest$Classification == "Tissue-Enriched"] <- "Tissue-Specific"
+CEA_annotation_latest$Classification[CEA_annotation_latest$Classification == "Housekepping"] <- "Housekeeping"
+```
+
+```{r}
+save(
+    CEA_annotation_latest,
+    file = here::here(data, "data/CEA_annotation_latest.rda"),
+    compress = "xz"
+)
+
+write_csv(CEA_annotation_latest,
+     file = here::here(data, "data/CEA_annotation_latest.csv"))
+```
+
+### **Step 6:** Table of TF genes per Tissue
+```{r}
+head(CEA_annotation_latest)
+
+counts <- count(CEA_annotation_latest$`Specific tissues`, CEA_annotation_latest$`TF family`)
+
+tf_count <- CEA_annotation_latest
+tf_count <- tf_count %>%
+  filter(!is.na(`Specific tissues`), !is.na(`TF family`)) %>%
+  group_by(`TF family`, `Specific tissues`) %>%
+  summarise(tf_count = n(), .groups = 'drop')
+
+tissues <- data.frame("Specific tissues" = c("Stem", "Leaf", "Trichome", "Seed", "Flower_female", "Root", "Flower_male", "Induced_male_flower", "Hypocotyl", "Bast_Fibre"))  
+names(tissues)[1] <- "Specific tissues"
+
+tf_count <- inner_join(tf_count, tissues, by = "Specific tissues")
+
+TF_per_tissue <- pivot_wider(
+    tf_count, names_from = `Specific tissues`, values_from = tf_count
+) |>
+    tibble::column_to_rownames("TF family")
+
+TF_per_tissue$Total <- rowSums(TF_per_tissue, na.rm = T)
+TF_per_tissue <- as.data.frame(TF_per_tissue)
+TF_per_tissue <- t(TF_per_tissue)
+TF_per_tissue <- as.data.frame(TF_per_tissue)
+TF_per_tissue$Total <- rowSums(TF_per_tissue, na.rm = T)
+TF_per_tissue <- as.data.frame(TF_per_tissue)
+TF_per_tissue <- t(TF_per_tissue)
+TF_per_tissue <- as.data.frame(TF_per_tissue)
+
+
+# Separate the 'Total' line
+total_row <- TF_per_tissue["Total", ]
+
+# Remove 'Total' row from original data frame
+TF_per_tissue_no_total <- TF_per_tissue[rownames(TF_per_tissue) != "Total", ]
+
+TF_per_tissue <- TF_per_tissue_no_total %>%
+  as.data.frame() %>%
+  arrange(desc(Total))
+
+TF_per_tissue <- rbind(TF_per_tissue, total_row)
+
+save(
+    TF_per_tissue,
+    file = here::here(data, "data/TF_per_tissue.rda"),
+    compress = "xz"
+)
+
+write_csv(TF_per_tissue,
+     file = here::here(data, "data/TF_per_tissue.csv"))
+```

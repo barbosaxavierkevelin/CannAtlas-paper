@@ -1,0 +1,530 @@
+---
+title: "Cannabis Expression Atlas - Methods"
+author: "Kevelin Barbosa-Xavier, Francisnei Pedrosa-Silva, Fabricio Almeida-Silva,
+  Thiago M. Venancio"
+date: "2024-08-22"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, warning = FALSE, message = FALSE)
+```
+
+## **Data acquisition, quality checks, quantification and metadata standardization**
+
+**Resume:** We identified the available cannabis RNA-Seq data on the Sequence Read Archive (SRA) database using the search parameters “cannabis sativa”[organism] AND “rna-seq”[strategy]. We used the R package ‘bears’ (Almeida-Silva, Pedrosa-Silva and Venancio, 2023) to obtain sample metadata with the create_sample_info() function. The FASTQ files were downloaded from the European Nucleotide Archive’s mirror of SRA using the download_from_ena() function, and file integrity was verified with the check_md5() function. Adapters and low quality bases were removed using FASTP (Chen et al., 2018). This step served as the first quality check, where samples with a mean read length less than 40 and/or a Q20 rate below 80% post-filtering were excluded (Almeida-Silva and Venancio, 2021; Almeida-Silva, Pedrosa-Silva and Venancio, 2023).
+
+First of all, let's load required packages and data.
+```{r load_data}
+set.seed(123) # for reproducibility
+# Load packages
+library(here)
+library(bears)
+library(GenomicFeatures)
+library(SummarizedExperiment)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(DESeq2)
+library(tidyverse)
+library(patchwork)
+library(ggplot2)
+library(tximport)
+```
+
+### **Step_1:** Data identification:
+Here we will use the "bears" package to identify cannabis RNA-Seq data publicly available and download their metadata.
+
+- Install the bears package
+
+This is the most important package to download and pre-process these data.
+```{r}
+# Important dependencies: "Rsubread", "SummarizedExperiment", "rtracklayer".
+
+if (!requireNamespace("remotes", quietly = TRUE)) {
+    install.packages("remotes")
+}
+
+remotes::install_github("almeidasilvaf/bears")
+```
+
+- Define the terms to be used to search the interest data
+```{r}
+search_term <- "Cannabis sativa[organism] AND rna-seq[strategy]"
+```
+
+- Search and get the metadata (network connection needed)
+```{r}
+metadata <- bears::create_sample_info(search_term, retmax = 10000)
+
+biosamples_total <- unique(metadata$BioSample)
+length(biosamples_total)
+```
+
+The previous step will download the metadata for all samples founded, if you are refreshing your dataset and need to download the fastq files just of the new samples, you will need to split these samples from the oldest, to do it:
+
+- Load the previous samples
+```{r}
+load("/sample_metadata_complete_2.rda") #your file path here
+```
+
+- Perform the split that you need
+```{r}
+metadata_oldest <- as.data.frame(sample_metadata_complete_2)
+head(metadata_oldest)
+metadata_oldest$BioSample <- NULL
+length(metadata_oldest$Experiment)
+
+new_metadata <- dplyr::anti_join(metadata, metadata_oldest, by = "Run")
+length(unique(new_metadata$BioSample))
+```
+
+### Create the dir structure to perfom the analysis
+```{r echo = FALSE, fig.align='center'}
+data <- "/media/winterfell/kevelin/doutorado/analises_JLmY_reference/CSEA_LATEST_08_2024/kevelin/"
+```
+```{r}
+# choose the work directoy
+data <- "/your/path/here/"
+
+# create bears dir structure
+rootdir <- here::here(data)
+ds <- bears::create_dir_structure(rootdir)
+```
+
+### **Step_2:** Downloading samples
+```{r}
+urls <- bears::get_url_ena(new_metadata)
+options(timeout = 6000)
+download <- bears::download_from_ena(new_metadata, fastqdir = ds$fastqdir)
+```
+
+### Check downloaded files integrity
+```{r}
+# check md5sum
+integrity <- bears::check_md5(
+  run_accessions = new_metadata$Run,
+  fastqdir = ds$fastqdir
+)
+
+failed_corrupt <- integrity[integrity$Status == F, "Run"]
+failed_corrupt <- unique(as.character(failed_corrupt))
+```
+
+bears package note: "The `failed_corrupt` object is a character vector containing run accessions that
+failed the integrity check and, thus, must be re-downloaded. 
+Now, let's also check for files that were not downloaded at all. Here, we will 
+only consider for re-download runs that are part of BioProjects with 
+effectively downloaded runs. In other words, if all runs of a BioProject were 
+not downloaded, I will ignore them (they are probably not available on EBI)." (Almeida-Silva, Pedrosa-Silva and Venancio, 2023).
+
+```{r}
+# Get download status
+dstatus <- bears::fastq_exists(new_metadata, fastqdir = ds$fastqdir)
+
+# Get BioProject info of failed runs
+failed_bioproject <- dstatus |>
+    dplyr::full_join(new_metadata)
+
+# Get BioProjects with missing percentage (m) = 0 < m < 100
+bioprojects_download <- failed_bioproject |>
+    dplyr::group_by(BioProject) |>
+    dplyr::summarise(perc = sum(is.na(Status)) / length(BioProject)) |>
+    dplyr::filter(perc != 0 & perc != 1)
+
+# Get vector of runs from these BioProjects to re-download
+failed_nd <- failed_bioproject |>
+    dplyr::filter(is.na(Status) & BioProject %in% bioprojects_download$BioProject) |>
+    dplyr::select(Run)
+
+failed_nd <- unique(as.character(failed_nd$Run))
+
+# Metadata of failed runs only
+todownload <- c(failed_corrupt, failed_nd)
+metadata_failed <- new_metadata[new_metadata$Run %in% todownload, ]
+```
+
+If you have failed files, return to the download section using the `metadata_failed` info and re rum the download and file integrity steps.
+
+### **Step_3:** Sequence QC and filtering (FASTP)
+
+bears package note: "Adapters and low-quality bases were identified and removed with fastp (Chen et al., 2018) using the function trim_reads(). As a quality control FASTQ files with mean read length <40 and/or Q20 rate <80% after filtering were considered as having insufficient quality and removed from next steps." (Almeida-Silva, Pedrosa-Silva and Venancio, 2023).
+
+- Remove sequence adapters and low-quality bases with __fastp__.
+
+- istall fastp in a conda environment
+```{bash}
+#{bash}
+#crate the conda env
+conda create -n bears
+
+# install fastp-0.23.4
+conda install bioconda::fastp
+
+#run R or Rstudio into this environment
+```
+
+```{r echo = FALSE, fig.align='center'}
+# confirm the fastp installation
+library(bears)
+fastp_is_installed()
+```
+- Run fastp
+```{r}
+fastp_status <- trim_reads(
+    new_metadata,
+    fastqdir = ds$fastqdir,
+    filtdir = ds$filtdir,
+    qcdir = ds$qcdir,
+    threads = 16,
+    delete_raw = TRUE
+)
+fastp_status
+```
+
+- Get a metadata data frame with only reads that have undergone filtering
+```{r echo = FALSE, fig.align='center'}
+filtdir = "/media/winterfell/kevelin/doutorado/analises_JLmY_reference/CSEA_2024/02_filtered_FASTQ/"
+```
+```{r}
+filtered_reads <- unique(
+    gsub(
+        "(//.fastq.*)|(_.*)", "", 
+        basename(list.files(ds$filtdir, pattern = "fastq.gz"))
+    )
+)
+filtered_reads_df <- data.frame("Run" = filtered_reads)
+```
+
+- After trim reads, we remove low-quality files based on the following criteria:
+
+1. Mean length after filtering <40
+2. Q20 rate <80% after filtering.
+```{r echo = FALSE, fig.align='center'}
+fastp_stats <- bears::summary_stats_fastp("/media/winterfell/kevelin/doutorado/analises_JLmY_reference/CSEA_2024/QC_dir/")
+```
+```{r}
+# Get a data frame of summary stats from fastp
+fastp_stats <- bears::summary_stats_fastp(ds$qcdir)
+ds$qcdir
+save(
+    fastp_stats, compress = "xz",
+    file = here(data, "data/fastp_stats.rda")
+)
+```
+
+```{r}
+# Remove files whose mean length after filtering is <40 and Q20 <80%
+keep <- fastp_stats |>
+    dplyr::filter(after_q20rate >= 0.8) |>
+    dplyr::filter(after_meanlength >= 40) |>
+    dplyr::pull(Sample)
+
+filtered_metadata <- metadata[
+    metadata$Run %in% keep, 
+]
+rownames(filtered_metadata) <- 1:nrow(filtered_metadata)
+```
+
+- identifying the biosamples that are removed to a better experiment control
+```{r}
+removed <- dplyr::anti_join(metadata, filtered_metadata, by = "BioSample")
+removed_biosamples <- unique(removed$BioSample)
+removed_biosamples <- as.data.frame(removed_biosamples)
+names(removed_biosamples) <- "BioSample"
+removed_biosamples_1 <- dplyr::inner_join(removed_biosamples, metadata, by= "BioSample")
+
+#biosamples that passed the filtering
+biosamples_ok <- data.frame(Run = keep)
+biosamples_ok <- dplyr::inner_join(metadata, biosamples_ok, by = "Run")
+biosamples_ok <- unique(biosamples_ok$BioSample)
+biosamples_ok <- as.data.frame(biosamples_ok)
+names(biosamples_ok) <- "BioSample"
+biosamples_ok <- dplyr::left_join(biosamples_ok, metadata, by = "BioSample")
+length(unique(biosamples_ok$BioSample))
+```
+
+### **Step_4:** Quantifying transcript abundance
+
+Now, we will quantify transcript abundance with __salmon__. To do that, 
+we first need to index the reference transcriptome.
+
+```{bash}
+#installing salmon-1.10.3 at the conda environment where you use R
+conda install bioconda::salmon
+```
+
+```{r test_installation}
+library(bears)
+# Test installation of external dependencies
+salmon_is_installed()
+```
+- Index transcriptome
+```{r echo = FALSE, fig.align='center'}
+transcriptome_path <- "/media/winterfell/kevelin/doutorado/analises_JLmY_reference/CSEA_2024/reference/JL_mother_Y_transcriptome.fasta"
+```
+```{r}
+transcriptome_path <- "your/path/here/transcriptome.fasta"
+```
+
+```{r}
+idx_salmon <- bears::salmon_index(
+    salmonindex = ds$salmonindex,
+    transcriptome_path = transcriptome_path
+)
+
+idx_salmon
+```
+
+Then, we can quantify transcript abundance.
+```{r}
+quant_salmon <- bears::salmon_quantify(
+    filtered_metadata,
+    filtdir = filtdir,
+    salmonindex = ds$salmonindex,
+    salmondir = ds$salmondir,
+    threads = 62
+)
+
+# Checking percentage of samples that ran sucessfully
+n_ok <- nrow(quant_salmon[!is.na(quant_salmon$status), ])
+n_ok / nrow(quant_salmon)
+```
+
+Now, let's obtain
+mapping rates for each BioSample to see whether or not we need to discard 
+samples. Here, we will remove samples with mapping rate <50% (i.e., less than
+50% of the reads failed to "map").
+```{r}
+# Get a data frame of mapping rate per BioSample
+salmondir = ds$salmondir
+
+mapping_rate <- bears::summary_stats_salmon(salmondir, quant_salmon$sample)
+
+save(
+    mapping_rate, compress = "xz",
+    file = here(data, "data/mapping_rate.rda")
+)
+```
+
+```{r}
+# Removing BioSamples with mapping rate <50%
+biosamples_to_keep <- mapping_rate |>
+    dplyr::filter(Mapping_rate >= 50) |>
+    dplyr::pull(BioSample)
+
+biosamples_to_keep <- as.data.frame(biosamples_to_keep)
+names(biosamples_to_keep)[1] <- "BioSample"
+
+# Create the final metadata df
+final_metadata_new <- dplyr::left_join(biosamples_to_keep, filtered_metadata, by = "BioSample")
+final_biosamples_new <- unique(final_metadata_new$BioSample)
+```
+
+```{r}
+# BioSamples removed
+biosamples_to_remove <- mapping_rate |>
+    dplyr::filter(Mapping_rate < 50) |>
+    dplyr::pull(BioSample)
+
+biosamples_to_remove <- as.data.frame(biosamples_to_remove)
+names(biosamples_to_remove)[1] <- "BioSample"
+
+biosamples_to_remove_2 <- dplyr::inner_join(biosamples_to_remove, filtered_metadata, by = "BioSample")
+length(unique(biosamples_to_remove_2$BioSample))
+```
+
+### **Step_5:** Standardizing samples metadata
+Sometimes essential metadata information needs to be standardized or obtained manually.
+
+- Standardizing tissue and cultivar names and adding chemotype information.
+```{r}
+#capitalizing all the first letters
+final_metadata_new$Tissue <- stringr::str_to_title(final_metadata_new$Tissue)
+
+# Using a previous dataframe to standardize information from old samples
+metadata_oldest <- data.frame("BioSample" = metadata_all_2024_february$BioSample, "Tissue" = metadata_all_2024_february$Tissue, "Cultivar" = metadata_all_2024_february$Cultivar, "Chemotype" = metadata_all_2024_february$Type)
+
+biosamples_to_keep <- dplyr::full_join(biosamples_to_keep, metadata_oldest, by = "BioSample")
+
+# separating the new samples for manual standardization
+biosmples_new_infos <- dplyr::anti_join(final_metadata_new, metadata_oldest, by = "BioSample")
+biosmples_new_infos <- data.frame("BioSample" = biosmples_new_infos$BioSample, "Tissue" = biosmples_new_infos$Tissue, "Cultivar" = biosmples_new_infos$Cultivar)
+
+biosamples_to_keep <- dplyr::full_join(biosamples_to_keep, biosmples_new_infos, by = "BioSample")
+
+# save data frame and perform the necessary editions by hand
+readr::write_csv(biosamples_to_keep,
+          file = here::here(data, "data/biosamples_to_keep.csv"))
+
+# importing the edited table (we need to search by hand the cultivar, type and tissue for some biosamples)
+biosamples_to_keep <- readr::read_csv("data/biosamples_to_keep.csv")
+head(biosamples_to_keep)
+
+# join this infos with the other metadatas
+# remove the oldest columns
+final_metadata_new$Tissue <- NULL
+final_metadata_new$Cultivar <- NULL
+
+# join this infos with the other metadatas
+final_metadata_new <- full_join(final_metadata_new, biosamples_to_keep, by = "BioSample")
+
+final_metadata_new
+final_metadata_new$Tissue[final_metadata_new$Tissue == "Flower_IM"] <- "Induced_male_flower"
+final_metadata_new[121, 'Chemotype'] <- rep('Type III', 1)
+final_metadata_new[303, 'Chemotype'] <- rep(NA, 1)
+final_metadata_new[304, 'Chemotype'] <- rep(NA, 1)
+final_metadata_new[305, 'Chemotype'] <- rep(NA, 1)
+final_metadata_new[306, 'Chemotype'] <- rep(NA, 1)
+```
+
+We observe that the sample `SAMN00630395` had no information for bioprojec, tissue, cultivar, type, anithing, so we will exclude this sample.
+```{r}
+final_metadata_new <- final_metadata_new[-605, ]
+```
+
+
+Saving the filtered metadata
+```{r}
+save(
+    final_metadata_new, compress = "xz",
+    file = here(data, "/data/final_metadata_new.rda")
+)
+```
+
+### **Step_6:** Read and parse quantitative data from __salmon__ output files.
+
+```{r}
+load("data/final_metadata_new.rda")
+# removing the Run and experiment columns to avoid duplicated biosamples lines at the df
+final_metadata_atlas <- final_metadata_new |>
+  dplyr::select(-c(Run, Experiment))
+```
+
+- From salmon `quant.sf` files to `SummarizedExperiment`
+
+Here, we will obtain a `SummarizedExperiment` object containing gene-level
+transcript abundances in TPM and bias-corrected counts. Counts will be obtained
+using the "bias correction without an offset" method from the Bioconductor
+package `tximport`.
+
+To create the `SummarizedExperiment` object, we will need a 2-column
+data frame of transcript-to-gene mapping. Let's create it.
+```{r echo = FALSE, fig.align='center'}
+#Create a data frame of transcript-to-gene mapping
+tx <- Biostrings::readDNAStringSet(
+    here("/media/winterfell/kevelin/doutorado/analises_JLmY_reference/CSEA_2024/reference/JL_mother_Y_transcriptome.fasta")
+)
+```
+```{r tx2gene}
+#Create a data frame of transcript-to-gene mapping
+tx <- Biostrings::readDNAStringSet(
+    here("your/transcriptome.fasta")
+)
+tx2gene <- data.frame(
+    TXNAME = gsub(" \\|.*", "", names(tx)),
+    GENEID = gsub(".*\\| ", "", names(tx))
+)
+```
+
+```{r echo = FALSE, fig.align='center'}
+gff3_path_jl <- "/media/winterfell/kevelin/doutorado/analises_JLmY_reference/CSEA_2024/reference/ref_gff_jl_mother_Y.gff"
+```
+```{r}
+# obtaining informations from gff file
+gff3_path_jl <- "/your/genome.gff"
+txdb <- makeTxDbFromGFF(gff3_path_jl)
+```
+
+```{r}
+# getting the interest informations
+k <- keys(txdb, keytype="TXNAME")
+tx2gene <- AnnotationDbi::select(txdb, keys = k, columns="GENEID", keytype = "TXNAME")
+head(tx2gene)
+
+k2 <- keys(txdb, keytype="CDSNAME")
+prot2gene2 <- AnnotationDbi::select(txdb, keys = k2, columns="GENEID", keytype = "CDSNAME")
+head(prot2gene2)
+
+save(
+    prot2gene2,
+    file = here::here(data, "/data/prot2gene2.rda"),
+    compress = "xz")
+
+save(
+    tx2gene, compress = "xz",
+    file = here(data, "data/tx2gene.rda")
+)
+```
+
+- Get gene-level transcript abundance estimates from salmon
+-- "Bias correction without an offset" method
+```{r}
+load("data/tx2gene.rda")
+se_atlas_gene <- salmon2se(
+    final_metadata_atlas,
+    level = "gene",
+    salmondir = salmondir,
+    tx2gene = tx2gene
+)
+
+save(
+    se_atlas_gene, compress = "xz",
+    file = here(data, "data/se_atlas_gene.rda")
+)
+
+sample_metadata_new <- as.data.frame(colData(se_atlas_gene))
+```
+
+```{r}
+# savind a df of gene and cds ids
+atlas_proteins_genes_id <- data_frame(Gene = prot2gene2$GENEID, Protein = prot2gene2$CDSNAME)
+
+save(atlas_proteins_genes_id,
+          file = here(data, "data/atlas_proteins_genes_id.rda"),
+     compress = "xz")
+```
+
+- Get transcript-level transcript abundance estimates from salmon
+```{r}
+se_atlas_transcript_2 <- salmon2se(
+    final_metadata_atlas,
+    level = "transcript",
+    salmondir = salmondir
+)
+
+save(
+    se_atlas_transcript_2, compress = "xz",
+    file = here(data, "data/se_atlas_transcript_2.rda")
+)
+```
+
+```{r}
+load("data/sample_metadata_new.rda")
+sample_metadata_new$BioSamples <- row.names(sample_metadata_new)
+```
+
+```{r}
+# Definindo a nova ordem (ajuste conforme necessário)
+new_order <- c("BioSamples", "Tissue", "Chemotype", "Cultivar", "Treatment", "Pubmed", "BioProject",
+               "Instrument", "Layout", "Selection_method", "SRA_sample", "SRA_study", "Study_title",
+               "Study_abstract", "Date", "Origin")
+
+# Reorganizando o dataframe
+sample_metadata_new <- sample_metadata_new[, new_order]
+```
+
+- save the files
+```{r}
+readr::write_csv(sample_metadata_new,
+          file = here::here(data, "data/sample_metadata_new.csv"))
+
+save(
+    sample_metadata_new,
+    file = here::here(data, "data/sample_metadata_new.rda"),
+    compress = "xz"
+)
+```
+
